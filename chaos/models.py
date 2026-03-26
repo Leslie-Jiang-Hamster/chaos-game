@@ -57,7 +57,5 @@ class DecisionTrace:
     role_name: str
     stage: str
     thought: str
-    intent: str
-    attitude: str
     action_name: str
     action_summary: str

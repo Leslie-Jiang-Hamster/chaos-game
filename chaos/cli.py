@@ -4,7 +4,7 @@ from pathlib import Path
 
 from chaos.config import load_model_config
 from chaos.llm import ArkResponsesClient
-from chaos.models import Role
+from chaos.models import Message, Role
 from chaos.role_loader import load_roles
 from chaos.round_one import LLMActionError, RoundOneGame
 from chaos.runtime_log import RuntimeLogger
@@ -26,34 +26,31 @@ def run() -> None:
         return
     game = RoundOneGame(player=player, contestants=contestants, llm=llm)
 
-    _print_intro(player)
-    print("\n【环境引导】")
     try:
-        opening_text, opening_source = game.opening_environment_scene()
-        print(f"{_source_tag(opening_source)} {opening_text}")
+        opening_message = game.opening_environment_message()
+        print(_render_message(opening_message))
     except LLMActionError as exc:
         print(str(exc))
     _print_help_overview(pre_game=True)
 
-    print("\n【自由社交开始】")
     try:
-        seeded_messages = game.seed_social_phase(count=3)
+        seeded_messages = game.seed_social_phase()
         for message in seeded_messages:
-            print(f"{_source_tag(message.source)} {message.speaker_id} {message.speaker_name}: {message.text}")
+            print(_render_message(message))
     except LLMActionError as exc:
         print(str(exc))
 
     _social_phase(game, phase_name="自由社交阶段", allow_choose=False)
 
     print("\n【广播开始】")
-    print(game.broadcast_round_intro())
+    print(_render_message(game.broadcast_round_intro_message()))
     _print_help_overview(pre_game=False)
 
     print("\n【规则宣读后的公开讨论】")
     try:
-        seeded_messages = game.seed_social_phase(count=4)
+        seeded_messages = game.seed_social_phase()
         for message in seeded_messages:
-            print(f"{_source_tag(message.source)} {message.speaker_id} {message.speaker_name}: {message.text}")
+            print(_render_message(message))
     except LLMActionError as exc:
         print(str(exc))
 
@@ -77,13 +74,6 @@ def _build_player() -> Role:
     )
 
 
-def _print_intro(player: Role) -> None:
-    print("\n========== 混沌生还者 MVP ==========")
-    print("当前只实现第 1 轮《诱饵均值》。")
-    print(f"玩家: {player.short_label}")
-    print(f"背景: {player.background}")
-
-
 def _build_llm_client() -> ArkResponsesClient | None:
     try:
         config = load_model_config(KEY_PATH)
@@ -93,19 +83,18 @@ def _build_llm_client() -> ArkResponsesClient | None:
 
     print(f"\n[LLM] 已加载火山引擎模型：{config.display_name} ({config.model})")
     print("[LLM] 环境描写、NPC 公开发言、私聊回复和数字选择将直接使用 Responses API，并启用缓存。")
-    print(f"[LLM] 运行日志将写入：{LOG_PATH}")
+    print(f"[LLM] 运行日志将写入：{LOG_PATH}\n")
     return ArkResponsesClient(config=config, logger=RuntimeLogger(LOG_PATH))
 
 
 def _print_help_overview(pre_game: bool) -> None:
     print("\n【帮助提示】")
-    print("世界内基础动作只有两个：`speak` 和 `end`。")
-    print("如果你一开始不知道该做什么，最稳妥的做法是先对环境 agent 开口。")
+    print("世界内基础动作只有两个：`speak` （说话）和 `end`（结束本阶段）。")
+    print("如果你一开始不知道该做什么，最稳妥的做法是先对环境agent (environment)开口，它会告诉回答你一些关于公开信息的问题。")
     print("你可以这样输入：")
-    print("speak environment 看看周围")
-    print("speak environment 这里都有谁")
-    print("speak public 大家先别急")
-    print("speak 004 你怎么看这件事")
+    print("speak environment 周围")
+    print("speak public 现在谁在看？")
+    print("speak 004 你是谁")
     if pre_game:
         print("end")
         print("输入 `help` 可以再次查看提示。正式游戏还没开始，先观察通常比急着表态更安全。")
@@ -113,6 +102,7 @@ def _print_help_overview(pre_game: bool) -> None:
         print("choose 33")
         print("end")
         print("输入 `help` 可以再次查看提示。现在广播已经宣读规则，你可以先试探，再决定数字。")
+    print('')
 
 
 def _social_phase(game: RoundOneGame, phase_name: str, allow_choose: bool) -> None:
@@ -165,18 +155,18 @@ def _handle_speak(game: RoundOneGame, raw: str) -> None:
         return
     if target == "public":
         message = game.player_public_speak(text)
-        print(f"{message.speaker_id} {message.speaker_name}: {message.text}")
+        print(_render_message(message))
         try:
-            for reply in game.npc_public_replies(count=2):
-                print(f"{_source_tag(reply.source)} {reply.speaker_id} {reply.speaker_name}: {reply.text}")
+            for reply in game.npc_public_replies(trigger_text=text, trigger_speaker_id=message.speaker_id):
+                print(_render_message(reply))
         except LLMActionError as exc:
             print(str(exc))
         return
     if target in {"environment", "env"}:
-        print(f"001 {game.player.name} -> 环境 agent: {text}")
+        print(f"[私聊] {_render_message(game.player_environment_speak(text))}")
         try:
             reply = game.environment_message(text)
-            print(f"{_source_tag(reply.source)} {reply.speaker_name}: {reply.text}")
+            print(f"[私聊] {_render_message(reply)}")
         except LLMActionError as exc:
             print(str(exc))
         return
@@ -187,11 +177,11 @@ def _handle_speak(game: RoundOneGame, raw: str) -> None:
         print(str(exc))
         return
     except LLMActionError as exc:
-        print(f"[私聊] 你 -> {target}: {sent.text}")
+        print(f"[私聊] {_render_message(sent)}")
         print(str(exc))
         return
-    print(f"[私聊] 你 -> {target}: {sent.text}")
-    print(f"[私聊] {_source_tag(reply.source)} {reply.speaker_id} {reply.speaker_name}: {reply.text}")
+    print(f"[私聊] {_render_message(sent)}")
+    print(f"[私聊] {_render_message(reply)}")
 
 
 def _handle_choose(game: RoundOneGame, raw: str) -> bool:
@@ -231,6 +221,13 @@ def _print_result(result) -> None:
 
 
 def _source_tag(source: str) -> str:
-    if source == "llm":
-        return "[LLM]"
+    if source in {"llm", "player"}:
+        return ""
     return "[system]"
+
+
+def _render_message(message: Message) -> str:
+    prefix = _source_tag(message.source)
+    if prefix:
+        return f"{prefix} {message.speaker_id} {message.speaker_name}: {message.text}"
+    return f"{message.speaker_id} {message.speaker_name}: {message.text}"

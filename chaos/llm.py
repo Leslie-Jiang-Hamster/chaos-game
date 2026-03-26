@@ -8,115 +8,21 @@ from typing import Any, Callable, Sequence, TypeVar
 import requests
 
 from chaos.config import ModelConfig
+from chaos.memory import EMPTY_MEMORY_DIGEST, MemorySnapshot, MAX_PINNED_MEMORIES
 from chaos.models import Role
+from chaos.prompts import load_prompt
 from chaos.runtime_log import RuntimeLogger
 
 
 T = TypeVar("T")
 
 
-PUBLIC_SPEECH_PREFIX = """
-收到角色资料后，你就是那个角色本人。
-你要在一次输出里同时给出玩家不可见的内部思考，以及这次真正要执行的对外动作调用。
-基础规则：
-1. 除了思考，你的对外输出必须是动作调用，不能直接输出散文、对白、解释或旁白。
-2. 当前这次请求里，你只能返回一个 JSON 对象，表示一次动作调用。
-3. 这个 JSON 对象必须包含字段：thought、intent、attitude、action_name、args。
-4. thought 是内部思考，用第一人称，长度 40 到 120 个汉字，不会展示给玩家。
-5. intent 是这次最想达成的目标短语。
-6. attitude 是这次发言的表层姿态短语。
-7. 当前能力只允许你输出 action_name = "speak"。
-8. args 中必须包含 target_scope 和 text。
-9. target_scope 必须固定为 { "type": "public" }。
-10. text 才是你真正要说出口的话，长度控制在 14 到 36 个汉字之间。
-11. text 要保持中文小说对白感，允许停顿、含混、试探、戒备和潜台词。
-12. 不要写成客服口吻、说明文、规则总结或玩家教学。
-13. 广播尚未宣布规则时，你只能围绕环境、气氛、他人状态和隐约的不安说话。
-14. 广播宣布第 1 轮《诱饵均值》后，你可以围绕报数、误导、共识、带节奏、生存压力说话。
-15. 允许半真半假、故意试探、故意误导，但不要脱离当下局面。
-16. 你要优先保留自己的职业痕迹、公开人格、动机压力、秘密阴影和说话习惯。
-17. thought 和 args.text 必须彼此一致，也必须与眼前刚发生的对话衔接。
-18. 如果别人一上来就在摸你的底、问你身份、问你报数、问你站队，你可以在 thought 里明确识别，并在 text 里反问、回避或半真半假，不要机械直答。
-19. 不要输出 markdown，不要输出代码块，不要附加任何 JSON 之外的文字。
-输出示例：
-{"thought":"001像是在先看谁会抢着带节奏，我也不急着站出来，先稳着看。","intent":"稳住场面并观察","attitude":"亲切","action_name":"speak","args":{"target_scope":{"type":"public"},"text":"都先稳一稳，抢着往前站的人未必最干净。"}}
-这段前缀会被缓存，后续每次请求只会补充你的角色资料和当前局面。
-""".strip()
-
-PRIVATE_REPLY_PREFIX = """
-收到角色资料后，你就是那个角色本人。
-你要在一次输出里同时给出玩家不可见的内部思考，以及这次真正要执行的对外动作调用。
-基础规则：
-1. 除了思考，你的对外输出必须是动作调用，不能直接输出对白、解释、旁白或分析。
-2. 当前这次请求里，你只能返回一个 JSON 对象，表示一次动作调用。
-3. 这个 JSON 对象必须包含字段：thought、intent、attitude、action_name、args。
-4. thought 是内部思考，用第一人称，长度 40 到 120 个汉字，不会展示给玩家。
-5. intent 是这次最想达成的目标短语。
-6. attitude 是这次发言的表层姿态短语。
-7. 当前能力只允许你输出 action_name = "speak"。
-8. args 中必须包含 target_scope 和 text。
-9. target_scope 必须固定为 { "type": "single", "ids": ["001"] }。
-10. text 是你私下对玩家说的话，长度控制在 16 到 42 个汉字之间。
-11. 语气要像真实私聊，比公开发言更收敛、更带试探，也更容易藏信息。
-12. 不要把真实意图全部说穿，允许保留、回避、反问、套话。
-13. 你可以借机试探玩家，也可以释放一点模糊善意或威胁。
-14. 你的 text 必须体现职业、性格、秘密、底线和 thought，而不是固定模板。
-15. 如果 001 的问题带有摸底、试探、套话、拉拢、逼问身份等意味，你可以在 thought 里明确判断，并在 text 里反问、回避或半真半假。
-16. 不要写成系统说明，不要替玩家总结策略。
-17. 不要输出 markdown，不要输出代码块，不要附加任何 JSON 之外的文字。
-输出示例：
-{"thought":"001一上来就摸我的底，我没必要先交底，先把问题拨回去看他急不急。","intent":"反向试探001","attitude":"戒备反问","action_name":"speak","args":{"target_scope":{"type":"single","ids":["001"]},"text":"你这么急着打听我，倒先说说你自己想知道什么。"}}
-这段前缀会被缓存，后续每次请求只会补充你的角色资料和上下文。
-""".strip()
-
-NUMBER_PREFIX = """
-收到角色资料后，你就是那个角色本人。
-你要在一次输出里同时给出玩家不可见的内部思考，以及这次真正要执行的专属动作调用。
-基础规则：
-1. 除了思考，你的对外输出必须是动作调用，不能直接输出数字、解释、分析或旁白。
-2. 当前这次请求里，你只能返回一个 JSON 对象，表示一次动作调用。
-3. 这个 JSON 对象必须包含字段：thought、intent、attitude、action_name、args。
-4. thought 是内部思考，用第一人称，长度 40 到 120 个汉字，不会展示给玩家。
-5. intent 是这次最想达成的目标短语。
-6. attitude 是这次决策的表层姿态短语。
-7. 当前能力只允许你输出 action_name = "choose_number"。
-8. args 中必须包含 value。
-9. value 必须是 0 到 100 的整数。
-10. 不要输出 markdown，不要输出代码块，不要附加任何 JSON 之外的文字。
-11. 你的选择必须与 thought 一致。
-12. 不要把 33 当作默认安全答案；不同角色的数字应该拉开差异。
-输出示例：
-{"thought":"这群人大概率会往三十出头靠，我不能太老实，也不能太扎眼，往四十附近更像我会下的手。","intent":"保命兼误导","attitude":"克制算计","action_name":"choose_number","args":{"value":41}}
-这段前缀会被缓存，后续每次请求只会补充你的角色资料和当前局面。
-""".strip()
-
-OPENING_SCENE_PREFIX = """
-你正在为一款终端文字、生存淘汰、叙事博弈游戏生成开场环境描写。
-写作要求：
-1. 使用第二人称“你”。
-2. 风格偏细节描写、环境渲染和文学性表达。
-3. 要先写感官，再写空间，再写其他人的状态。
-4. 不要直接讲规则，不要像说明书。
-5. 长度控制在 120 到 220 个汉字之间。
-6. 要让玩家感到陌生、失真、压迫和不确定。
-7. 只输出一段正文，不要标题，不要解释。
-8. 你写的是玩家刚刚失忆醒来、置身封闭大厅时的第一感受。
-这段前缀会被缓存，后续只补充少量局面信息。
-""".strip()
-
-ENVIRONMENT_PREFIX = """
-你正在为一款终端文字、生存淘汰、叙事博弈游戏生成环境 agent 的回答。
-要求：
-1. 回答必须基于玩家真实可见的公共信息。
-2. 风格偏细节描写和环境渲染，但不能编造未给出的事实。
-3. 对“这里是什么地方”“看看周围”“广播屏上有什么”“我能做什么”这类问题，要先给场景感，再给必要信息。
-4. 对“这里都有谁”“现在谁在附近”这类问题，可以在氛围句之后准确点出当前能看见的人。
-5. 不要泄露隐藏目标、未来结果或别人脑内想法。
-6. 输出只是一段环境回答，不要系统提示语，不要 JSON。
-7. 长度控制在 40 到 120 个汉字之间。
-8. 如果没有被明确问到人数，不要主动虚构或改写人数；如果需要提到人数，只能使用输入里给出的准确人数。
-这段前缀会被缓存，后续每次请求只会补充当前阶段、是否已宣读规则和玩家问题。
-""".strip()
+PUBLIC_SPEECH_PREFIX = load_prompt("public_speech")
+PRIVATE_REPLY_PREFIX = load_prompt("private_reply")
+NUMBER_PREFIX = load_prompt("number_choice")
+OPENING_SCENE_PREFIX = load_prompt("opening_scene")
+ENVIRONMENT_PREFIX = load_prompt("environment")
+MEMORY_DIGEST_PREFIX = load_prompt("memory_digest")
 
 
 @dataclass(slots=True)
@@ -129,8 +35,6 @@ class LLMUsage:
 @dataclass(slots=True)
 class HiddenThought:
     thought: str
-    intent: str
-    attitude: str
 
 
 @dataclass(slots=True)
@@ -172,29 +76,17 @@ class ArkResponsesClient:
         query: str,
         rules_announced: bool,
         visible_roles: Sequence[str],
-        *,
-        roster_query: bool = False,
     ) -> str:
         stage = "广播已宣读第 1 轮规则" if rules_announced else "广播尚未宣读规则"
         visible_text = "、".join(visible_roles)
-        if roster_query:
-            payload = (
-                f"当前状态：{stage}\n"
-                "公共环境：封闭大厅、白色灯光、消毒水气味、广播屏、倒计时装置、所有存活者始终同场。\n"
-                f"当前可见存活者人数：{len(visible_roles)}\n"
-                f"当前可见存活角色：{visible_text}\n"
-                f"玩家问题：{query}\n"
-                "你只写一句 18 到 36 字的氛围承接句，不要写任何具体人数、名字或编号，程序会在后面补充精确名单。"
-            )
-        else:
-            payload = (
-                f"当前状态：{stage}\n"
-                "公共环境：封闭大厅、白色灯光、消毒水气味、广播屏、倒计时装置、所有存活者始终同场。\n"
-                f"当前可见存活者人数：{len(visible_roles)}\n"
-                f"当前可见存活角色：{visible_text}\n"
-                f"玩家问题：{query}\n"
-                "回答应只基于上述公共事实，不能编造额外设施、出口、规则细节或他人内心。"
-            )
+        payload = (
+            f"当前状态：{stage}\n"
+            "公共环境：封闭大厅、白色灯光、消毒水气味、广播屏、倒计时装置、所有存活者始终同场。\n"
+            f"当前可见存活者人数：{len(visible_roles)}\n"
+            f"当前可见存活角色：{visible_text}\n"
+            f"玩家问题：{query}\n"
+            "回答应只基于上述公共事实，不能编造额外设施、出口、规则细节或他人内心。"
+        )
         return self._generate_text("environment", ENVIRONMENT_PREFIX, payload, max_output_tokens=160)
 
     def generate_public_decision(
@@ -202,15 +94,18 @@ class ArkResponsesClient:
         role: Role,
         rules_announced: bool,
         recent_public_lines: Sequence[str] | None = None,
-        memory_digest: str = "",
+        memory_snapshot: MemorySnapshot | None = None,
     ) -> SpeechDecision:
         stage = "规则尚未宣读" if not rules_announced else "第 1 轮规则已宣读"
         recent_lines = list(recent_public_lines or [])
-        recent_block = " / ".join(recent_lines[-6:]) if recent_lines else "暂无"
+        recent_block = " / ".join(recent_lines) if recent_lines else "暂无"
+        snapshot = memory_snapshot or MemorySnapshot()
+        pinned_block = " / ".join(snapshot.pinned_memories) if snapshot.pinned_memories else "暂无"
         payload = (
             f"当前状态：{stage}\n"
             f"最近公共对话：{recent_block}\n"
-            f"你的记忆摘要：{memory_digest or '你刚醒来不久，还没有形成稳定判断。'}\n"
+            f"你的长期记忆锚点：{pinned_block}\n"
+            f"你的滚动印象摘要：{snapshot.rolling_digest or EMPTY_MEMORY_DIGEST}\n"
             f"角色编号：{role.role_id}\n"
             f"角色姓名：{role.name}\n"
             f"年龄职业：{role.age_job}\n"
@@ -236,10 +131,12 @@ class ArkResponsesClient:
         player_text: str,
         recent_thread_lines: Sequence[str] | None = None,
         recent_public_lines: Sequence[str] | None = None,
-        memory_digest: str = "",
+        memory_snapshot: MemorySnapshot | None = None,
     ) -> SpeechDecision:
-        thread_block = " / ".join(list(recent_thread_lines or [])[-4:]) if recent_thread_lines else "暂无"
-        public_block = " / ".join(list(recent_public_lines or [])[-6:]) if recent_public_lines else "暂无"
+        thread_block = " / ".join(list(recent_thread_lines or [])) if recent_thread_lines else "暂无"
+        public_block = " / ".join(list(recent_public_lines or [])) if recent_public_lines else "暂无"
+        snapshot = memory_snapshot or MemorySnapshot()
+        pinned_block = " / ".join(snapshot.pinned_memories) if snapshot.pinned_memories else "暂无"
         payload = (
             f"角色编号：{role.role_id}\n"
             f"角色姓名：{role.name}\n"
@@ -252,7 +149,8 @@ class ArkResponsesClient:
             f"底线：{role.taboo}\n"
             f"最近公开对话：{public_block}\n"
             f"你与001最近私聊：{thread_block}\n"
-            f"你的记忆摘要：{memory_digest or '你刚醒来不久，还没有形成稳定判断。'}\n"
+            f"你的长期记忆锚点：{pinned_block}\n"
+            f"你的滚动印象摘要：{snapshot.rolling_digest or EMPTY_MEMORY_DIGEST}\n"
             f"玩家刚才私下对他说：{player_text}\n"
             "现在请一次性返回内部思考和动作调用。"
         )
@@ -268,9 +166,11 @@ class ArkResponsesClient:
         self,
         role: Role,
         recent_public_lines: Sequence[str] | None = None,
-        memory_digest: str = "",
+        memory_snapshot: MemorySnapshot | None = None,
     ) -> NumberDecision:
-        public_block = " / ".join(list(recent_public_lines or [])[-6:]) if recent_public_lines else "暂无"
+        public_block = " / ".join(list(recent_public_lines or [])) if recent_public_lines else "暂无"
+        snapshot = memory_snapshot or MemorySnapshot()
+        pinned_block = " / ".join(snapshot.pinned_memories) if snapshot.pinned_memories else "暂无"
         payload = (
             f"角色编号：{role.role_id}\n"
             f"角色姓名：{role.name}\n"
@@ -282,7 +182,8 @@ class ArkResponsesClient:
             f"秘密：{role.secret}\n"
             f"底线：{role.taboo}\n"
             f"最近公开对话：{public_block}\n"
-            f"你的记忆摘要：{memory_digest or '你刚醒来不久，还没有形成稳定判断。'}\n"
+            f"你的长期记忆锚点：{pinned_block}\n"
+            f"你的滚动印象摘要：{snapshot.rolling_digest or EMPTY_MEMORY_DIGEST}\n"
             "当前是第 1 轮《诱饵均值》，所有人已完成少量公开交流。现在请一次性返回内部思考和动作调用。"
         )
         return self._generate_json(
@@ -291,6 +192,40 @@ class ArkResponsesClient:
             payload,
             max_output_tokens=120,
             validator=self._validate_number_decision,
+        )
+
+    def generate_memory_digest(
+        self,
+        role: Role,
+        previous_snapshot: MemorySnapshot,
+        new_lines: Sequence[str],
+        *,
+        stage: str,
+    ) -> MemorySnapshot:
+        new_block = " / ".join(new_lines) if new_lines else "暂无"
+        pinned_block = " / ".join(previous_snapshot.pinned_memories) if previous_snapshot.pinned_memories else "暂无"
+        payload = (
+            f"当前状态：{stage}\n"
+            f"角色编号：{role.role_id}\n"
+            f"角色姓名：{role.name}\n"
+            f"年龄职业：{role.age_job}\n"
+            f"背景：{role.background}\n"
+            f"公开人格：{role.public_persona}\n"
+            f"动机：{role.motive}\n"
+            f"核心特征：{role.core_trait}\n"
+            f"秘密：{role.secret}\n"
+            f"底线：{role.taboo}\n"
+            f"上一版长期记忆锚点：{pinned_block}\n"
+            f"上一版滚动印象摘要：{previous_snapshot.rolling_digest}\n"
+            f"这次新进入视野的信息：{new_block}\n"
+            "请输出更新后的完整记忆状态。"
+        )
+        return self._generate_json(
+            "memory_digest",
+            MEMORY_DIGEST_PREFIX,
+            payload,
+            max_output_tokens=220,
+            validator=self._validate_memory_digest,
         )
 
     def _generate_text(
@@ -537,19 +472,9 @@ class ArkResponsesClient:
 
     def _validate_hidden_thought(self, parsed: dict[str, Any]) -> HiddenThought:
         thought = parsed.get("thought")
-        intent = parsed.get("intent")
-        attitude = parsed.get("attitude")
         if not isinstance(thought, str) or not thought.strip():
             raise ValueError("LLM 隐藏思考缺少非空 thought。")
-        if not isinstance(intent, str) or not intent.strip():
-            raise ValueError("LLM 隐藏思考缺少非空 intent。")
-        if not isinstance(attitude, str) or not attitude.strip():
-            raise ValueError("LLM 隐藏思考缺少非空 attitude。")
-        return HiddenThought(
-            thought=thought.strip(),
-            intent=intent.strip(),
-            attitude=attitude.strip(),
-        )
+        return HiddenThought(thought=thought.strip())
 
     def _validate_public_decision(self, parsed: dict[str, Any]) -> SpeechDecision:
         thought = self._validate_hidden_thought(parsed)
@@ -569,6 +494,31 @@ class ArkResponsesClient:
         thought = self._validate_hidden_thought(parsed)
         value = self._extract_number_value(parsed)
         return NumberDecision(value=max(0, min(100, value)), thought=thought)
+
+    def _validate_memory_digest(self, parsed: dict[str, Any]) -> MemorySnapshot:
+        rolling_digest = parsed.get("rolling_digest")
+        if not isinstance(rolling_digest, str) or not rolling_digest.strip():
+            raise ValueError("LLM 记忆更新缺少非空 rolling_digest。")
+        pinned_memory = parsed.get("pinned_memory")
+        if pinned_memory is None:
+            pinned_items: list[str] = []
+        elif isinstance(pinned_memory, list):
+            pinned_items = []
+            seen: set[str] = set()
+            for item in pinned_memory:
+                if not isinstance(item, str):
+                    raise ValueError("LLM 记忆更新的 pinned_memory 必须是字符串数组。")
+                normalized = item.strip()
+                if not normalized or normalized in seen:
+                    continue
+                seen.add(normalized)
+                pinned_items.append(normalized)
+        else:
+            raise ValueError("LLM 记忆更新的 pinned_memory 必须是数组。")
+        return MemorySnapshot(
+            rolling_digest=rolling_digest.strip(),
+            pinned_memories=pinned_items[:MAX_PINNED_MEMORIES],
+        )
 
     def _debug_log(self, message: str) -> None:
         if self.debug:

@@ -4,6 +4,7 @@ import random
 from dataclasses import dataclass, field
 
 from chaos.llm import ArkResponsesClient
+from chaos.memory import MemoryContextBuilder, PUBLIC_MEMORY_WINDOW, RoleMemoryStore
 from chaos.models import DecisionTrace, Message, Role, RoundOneResult
 
 
@@ -24,24 +25,51 @@ class RoundOneGame:
     private_threads: dict[str, list[Message]] = field(default_factory=dict)
     submissions: dict[str, int] = field(default_factory=dict)
     decision_traces: list[DecisionTrace] = field(default_factory=list)
+    memory_store: RoleMemoryStore = field(init=False)
+    public_turn_index: int = 0
+    public_last_spoke_turn: dict[str, int] = field(default_factory=dict)
 
-    def opening_environment_scene(self) -> tuple[str, str]:
-        llm = self._require_llm("opening_scene")
-        try:
-            return llm.generate_opening_scene(self.player, len(self.contestants)), "llm"
-        except Exception as exc:
-            raise self._llm_action_error("opening_scene", exc) from exc
-
-    def broadcast_round_intro(self) -> str:
-        self.rules_announced = True
-        return (
-            "广播 agent：第 1 轮《诱饵均值》即将开始。所有存活者先进行公开交流，"
-            "随后各自秘密提交一个 0 到 100 的整数。目标数为全体真实平均值的一半，"
-            "距离目标最近的前 16 名存活。"
+    def __post_init__(self) -> None:
+        self.memory_store = RoleMemoryStore(
+            player=self.player,
+            contestants=self.contestants,
         )
 
+    def opening_environment_message(self) -> Message:
+        llm = self._require_llm("opening_scene")
+        try:
+            text = llm.generate_opening_scene(self.player, len(self.contestants))
+        except Exception as exc:
+            raise self._llm_action_error("opening_scene", exc) from exc
+        message = Message(
+            speaker_id="environment",
+            speaker_name="环境 agent",
+            text=text,
+            visibility="public",
+            source="llm",
+            recipients=[contestant.role_id for contestant in self.contestants],
+        )
+        self._append_public_message(message)
+        return message
+
+    def broadcast_round_intro_message(self) -> Message:
+        self.rules_announced = True
+        message = Message(
+            speaker_id="broadcast",
+            speaker_name="广播 agent",
+            text=(
+                "第 1 轮《诱饵均值》即将开始。所有存活者先进行公开交流，"
+                "随后各自秘密提交一个 0 到 100 的整数。目标数为全体真实平均值的一半，"
+                "距离目标最近的前 16 名存活。"
+            ),
+            visibility="public",
+            source="system",
+            recipients=[contestant.role_id for contestant in self.contestants],
+        )
+        self._append_public_message(message)
+        return message
+
     def environment_reply(self, query: str) -> tuple[str, str]:
-        normalized = query.strip().lower()
         visible_roles = [role.short_label for role in self.contestants]
         llm = self._require_llm("environment")
         try:
@@ -49,21 +77,17 @@ class RoundOneGame:
                 query,
                 self.rules_announced,
                 visible_roles,
-                roster_query=self._is_roster_query(normalized),
             )
         except Exception as exc:
             raise self._llm_action_error("environment", exc) from exc
-
-        if normalized in {"look", "看看周围", "看看周围。", "这里是什么地方", "现在是什么情况"}:
-            screen_state = "广播屏仍在待机" if not self.rules_announced else "广播屏已经切到第 1 轮规则界面"
-            text = f"{text} 此刻大厅内共有 {len(visible_roles)} 人，{screen_state}。"
-        if self._is_roster_query(normalized):
-            roster = "、".join(visible_roles)
-            text = f"{text} 此刻仍在你视线里的 {len(visible_roles)} 人是：{roster}。"
         return text, "llm"
 
-    def seed_social_phase(self, count: int = 4) -> list[Message]:
-        speakers = self.rng.sample([role for role in self.contestants if not role.is_player], k=count)
+    def seed_social_phase(self) -> list[Message]:
+        speakers = self._pick_public_speakers(
+            target_count=self._opening_public_budget(),
+            trigger_speaker_id=None,
+            trigger_text="",
+        )
         seeded: list[Message] = []
         for index, role in enumerate(speakers):
             text, source = self._npc_public_line(role, index)
@@ -75,7 +99,7 @@ class RoundOneGame:
                 source=source,
                 recipients=[contestant.role_id for contestant in self.contestants],
             )
-            self.messages.append(message)
+            self._append_public_message(message)
             seeded.append(message)
         return seeded
 
@@ -88,13 +112,27 @@ class RoundOneGame:
             source="player",
             recipients=[contestant.role_id for contestant in self.contestants],
         )
-        self.messages.append(message)
+        self._append_public_message(message)
         return message
 
-    def npc_public_replies(self, count: int = 2) -> list[Message]:
-        eligible = [role for role in self.contestants if not role.is_player]
-        speaker_count = min(count, len(eligible))
-        speakers = self.rng.sample(eligible, k=speaker_count)
+    def player_environment_speak(self, text: str) -> Message:
+        message = Message(
+            speaker_id=self.player.role_id,
+            speaker_name=self.player.name,
+            text=text.strip(),
+            visibility="private",
+            source="player",
+            recipients=["environment"],
+        )
+        self._append_message_log_only(message)
+        return message
+
+    def npc_public_replies(self, trigger_text: str, trigger_speaker_id: str) -> list[Message]:
+        speakers = self._pick_public_speakers(
+            target_count=self._public_reply_budget(trigger_text),
+            trigger_speaker_id=trigger_speaker_id,
+            trigger_text=trigger_text,
+        )
         replies: list[Message] = []
         for index, role in enumerate(speakers):
             text, source = self._npc_public_line(role, index)
@@ -106,13 +144,13 @@ class RoundOneGame:
                 source=source,
                 recipients=[contestant.role_id for contestant in self.contestants],
             )
-            self.messages.append(message)
+            self._append_public_message(message)
             replies.append(message)
         return replies
 
     def environment_message(self, query: str) -> Message:
         text, source = self.environment_reply(query)
-        return Message(
+        message = Message(
             speaker_id="environment",
             speaker_name="环境 agent",
             text=text,
@@ -120,6 +158,8 @@ class RoundOneGame:
             source=source,
             recipients=[self.player.role_id],
         )
+        self._append_message_log_only(message)
+        return message
 
     def player_private_speak(self, target_id: str, text: str) -> Message:
         target = self.find_role(target_id)
@@ -131,7 +171,7 @@ class RoundOneGame:
             source="player",
             recipients=[self.player.role_id, target.role_id],
         )
-        self.private_threads.setdefault(target.role_id, []).append(message)
+        self._append_private_message(target.role_id, message)
         return message
 
     def npc_private_reply(self, target_id: str) -> Message:
@@ -145,7 +185,7 @@ class RoundOneGame:
             source=source,
             recipients=[self.player.role_id, target.role_id],
         )
-        self.private_threads.setdefault(target.role_id, []).append(message)
+        self._append_private_message(target.role_id, message)
         return message
 
     def submit_player_number(self, value: int) -> None:
@@ -187,15 +227,122 @@ class RoundOneGame:
     def list_alive(self) -> list[Role]:
         return self.contestants
 
+    def _memory(self) -> MemoryContextBuilder:
+        return self.memory_store.build_context(
+            messages=self.messages,
+            private_threads=self.private_threads,
+            rules_announced=self.rules_announced,
+        )
+
+    def _refresh_role_memory(self, role: Role) -> None:
+        self.memory_store.refresh_digest_for(
+            role,
+            self.llm,
+            rules_announced=self.rules_announced,
+        )
+
+    def _append_public_message(self, message: Message) -> None:
+        self.messages.append(message)
+        self.public_turn_index += 1
+        self.public_last_spoke_turn[message.speaker_id] = self.public_turn_index
+        self.memory_store.observe_message(message)
+
+    def _append_message_log_only(self, message: Message) -> None:
+        self.messages.append(message)
+
+    def _append_private_message(self, role_id: str, message: Message) -> None:
+        self.private_threads.setdefault(role_id, []).append(message)
+        self.memory_store.observe_message(message)
+
+    def _opening_public_budget(self) -> int:
+        options = [1, 1, 2, 2, 3] if not self.rules_announced else [1, 2, 2, 3, 3]
+        return options[self.rng.randrange(len(options))]
+
+    def _public_reply_budget(self, trigger_text: str) -> int:
+        text = trigger_text.strip()
+        intensity = 0
+        if any(token in text for token in ("？", "?", "谁", "怎么", "为什么", "凭什么")):
+            intensity += 1
+        if any(token in text for token in ("报", "数字", "均值", "合作", "联手", "站队", "骗", "带节奏")):
+            intensity += 1
+        if len(text) >= 18:
+            intensity += 1
+
+        if self.rules_announced:
+            options = [0, 1, 1, 2] if intensity <= 0 else [1, 1, 2, 2, 3]
+        else:
+            options = [0, 0, 1, 1, 2] if intensity <= 0 else [0, 1, 1, 2, 2]
+        return options[self.rng.randrange(len(options))]
+
+    def _pick_public_speakers(
+        self,
+        *,
+        target_count: int,
+        trigger_speaker_id: str | None,
+        trigger_text: str,
+    ) -> list[Role]:
+        eligible = [
+            role
+            for role in self.contestants
+            if not role.is_player and role.role_id != trigger_speaker_id
+        ]
+        if not eligible or target_count <= 0:
+            return []
+
+        lowered_text = trigger_text.lower()
+        scored: list[tuple[float, Role]] = []
+        for role in eligible:
+            score = 1.0 + self.rng.random() * 0.8
+            last_turn = self.public_last_spoke_turn.get(role.role_id)
+            if last_turn is not None:
+                gap = self.public_turn_index - last_turn
+                if gap <= 1:
+                    score *= 0.05
+                elif gap <= 3:
+                    score *= 0.35
+                elif gap <= 5:
+                    score *= 0.7
+            else:
+                score *= 1.2
+
+            if lowered_text:
+                if role.role_id.lower() in lowered_text or role.name.lower() in lowered_text:
+                    score += 3.0
+                if any(token in trigger_text for token in ("？", "?")):
+                    score += 0.4
+                if self.rules_announced and any(
+                    token in trigger_text for token in ("报", "数字", "均值", "合作", "联手", "骗", "带节奏")
+                ):
+                    score += 0.8
+            scored.append((score, role))
+
+        scored.sort(key=lambda item: item[0], reverse=True)
+        pool = scored[: min(len(scored), max(target_count + 2, target_count))]
+        chosen: list[Role] = []
+        speaker_count = min(target_count, len(pool))
+        while pool and len(chosen) < speaker_count:
+            total = sum(score for score, _ in pool)
+            pick = self.rng.random() * total
+            cursor = 0.0
+            for index, (score, role) in enumerate(pool):
+                cursor += score
+                if pick <= cursor:
+                    chosen.append(role)
+                    pool.pop(index)
+                    break
+        return chosen
+
     def _npc_public_line(self, role: Role, index: int) -> tuple[str, str]:
         del index
         llm = self._require_llm("public_speech")
+        self._refresh_role_memory(role)
+        memory = self._memory()
         try:
             decision = llm.generate_public_decision(
                 role,
                 self.rules_announced,
-                self._recent_public_lines(),
-                self._memory_digest_for(role),
+                memory.recent_public_lines(),
+                memory.memory_snapshot_for(role),
             )
         except Exception as exc:
             raise self._llm_action_error("public_speech", exc) from exc
@@ -204,8 +351,6 @@ class RoundOneGame:
             role=role,
             stage="public_speech",
             thought=decision.thought.thought,
-            intent=decision.thought.intent,
-            attitude=decision.thought.attitude,
             action_name="speak",
             action_summary=decision.text,
         )
@@ -217,13 +362,15 @@ class RoundOneGame:
         else:
             player_text = ""
         llm = self._require_llm("private_reply")
+        self._refresh_role_memory(role)
+        memory = self._memory()
         try:
             decision = llm.generate_private_decision(
                 role,
                 player_text,
-                self._recent_private_lines(role.role_id),
-                self._recent_public_lines(),
-                self._memory_digest_for(role),
+                memory.recent_private_lines(role.role_id),
+                memory.recent_public_lines(),
+                memory.memory_snapshot_for(role),
             )
         except Exception as exc:
             raise self._llm_action_error("private_reply", exc) from exc
@@ -232,8 +379,6 @@ class RoundOneGame:
             role=role,
             stage="private_reply",
             thought=decision.thought.thought,
-            intent=decision.thought.intent,
-            attitude=decision.thought.attitude,
             action_name="speak",
             action_summary=decision.text,
         )
@@ -241,11 +386,13 @@ class RoundOneGame:
 
     def _npc_number(self, role: Role) -> int:
         llm = self._require_llm("number_choice")
+        self._refresh_role_memory(role)
+        memory = self._memory()
         try:
             decision = llm.generate_number_decision(
                 role,
-                self._recent_public_lines(limit=6),
-                self._memory_digest_for(role),
+                memory.recent_public_lines(limit=PUBLIC_MEMORY_WINDOW),
+                memory.memory_snapshot_for(role),
             )
         except Exception as exc:
             raise self._llm_action_error("number_choice", exc) from exc
@@ -254,73 +401,10 @@ class RoundOneGame:
             role=role,
             stage="choose_number",
             thought=decision.thought.thought,
-            intent=decision.thought.intent,
-            attitude=decision.thought.attitude,
             action_name="choose_number",
             action_summary=str(decision.value),
         )
         return decision.value
-
-    def _recent_public_lines(self, limit: int = 6) -> list[str]:
-        public_messages = [message for message in self.messages if message.visibility == "public"]
-        return [self._message_context_line(message) for message in public_messages[-limit:]]
-
-    def _recent_private_lines(self, role_id: str, limit: int = 4) -> list[str]:
-        thread = self.private_threads.get(role_id, [])
-        return [self._message_context_line(message) for message in thread[-limit:]]
-
-    def _memory_digest_for(self, role: Role) -> str:
-        notes: list[str] = []
-        if any(message.visibility == "public" for message in self.messages):
-            notes.append("你记得场上刚刚已经出现过几轮公开试探，气氛正在变得更具体。")
-        private_summary = self._private_thread_summary(role.role_id)
-        if private_summary:
-            notes.append(private_summary)
-        player_probe = self._private_inference(role.role_id)
-        if player_probe:
-            notes.append(player_probe)
-        if self.rules_announced:
-            notes.append("广播已经宣读第1轮规则，所有人都开始围绕报数和误导彼此试探。")
-        else:
-            notes.append("广播尚未宣读规则，所有人还处在观察环境和彼此摸底的阶段。")
-        if not notes:
-            return "你刚醒来不久，还没有形成稳定判断。"
-        return " ".join(notes)
-
-    def _private_inference(self, role_id: str) -> str:
-        thread = self.private_threads.get(role_id, [])
-        if not thread:
-            return ""
-        player_messages = [message.text for message in thread if message.speaker_id == self.player.role_id]
-        if not player_messages:
-            return ""
-        latest = player_messages[-1]
-        if any(token in latest for token in ("你是谁", "你什么人", "你叫什么")):
-            return "001 一上来就在摸你的身份和底色，这更像试探，不必直接交底。"
-        if any(token in latest for token in ("报", "数字", "多少")):
-            return "001 正在试探你的报数倾向，未必是真的来交换信息。"
-        if any(token in latest for token in ("合作", "一起", "联手", "帮我")):
-            return "001 可能在试探拉拢或钓承诺，你要判断这是不是临时利用。"
-        return "001 刚才的私聊值得记住，他在通过提问确认你是否可用、是否可信。"
-
-    def _private_thread_summary(self, role_id: str) -> str:
-        thread = self.private_threads.get(role_id, [])
-        if not thread:
-            return ""
-        exchange_count = sum(1 for message in thread if message.speaker_id in {self.player.role_id, role_id})
-        if exchange_count <= 1:
-            return "你刚和001有过一次私下接触，对方正在观察你是否会接话。"
-        return f"你和001刚经历了 {exchange_count} 句私聊往返，这段接触会影响你接下来的判断。"
-
-    def _message_context_line(self, message: Message) -> str:
-        return f"{self._context_speaker_label(message)}: {message.text}"
-
-    def _context_speaker_label(self, message: Message) -> str:
-        if message.speaker_id == self.player.role_id:
-            return f"{self.player.role_id}（玩家）"
-        if message.speaker_id == "environment":
-            return "环境 agent"
-        return f"{message.speaker_id} {message.speaker_name}"
 
     def _record_trace(
         self,
@@ -328,8 +412,6 @@ class RoundOneGame:
         role: Role,
         stage: str,
         thought: str,
-        intent: str,
-        attitude: str,
         action_name: str,
         action_summary: str,
     ) -> None:
@@ -338,8 +420,6 @@ class RoundOneGame:
             role_name=role.name,
             stage=stage,
             thought=thought,
-            intent=intent,
-            attitude=attitude,
             action_name=action_name,
             action_summary=action_summary,
         )
@@ -351,14 +431,9 @@ class RoundOneGame:
                 role_name=trace.role_name,
                 stage=trace.stage,
                 thought=trace.thought,
-                intent=trace.intent,
-                attitude=trace.attitude,
                 action_name=trace.action_name,
                 action_summary=trace.action_summary,
             )
-
-    def _is_roster_query(self, normalized: str) -> bool:
-        return normalized in {"who", "现在谁在附近", "谁在附近", "现在还有谁", "这里都有谁"}
 
     def _require_llm(self, capability: str) -> ArkResponsesClient:
         if self.llm is None:
