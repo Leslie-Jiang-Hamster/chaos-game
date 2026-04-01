@@ -8,3 +8,5 @@ key.yaml
 .env
 .venv/
 venv/
+
+.codex

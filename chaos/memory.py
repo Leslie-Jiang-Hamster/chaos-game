@@ -31,7 +31,7 @@ def context_speaker_label(player: Role, message: Message) -> str:
     if message.speaker_id == "environment":
         return "环境 agent"
     if message.speaker_id == "broadcast":
-        return "广播 agent"
+        return "主持人"
     return f"{message.speaker_id} {message.speaker_name}"
 
 
@@ -82,7 +82,7 @@ class RoleMemoryStore:
         if not pending_lines:
             return
         previous_snapshot = self.snapshot_for(role)
-        stage = "广播已宣读第 1 轮规则" if rules_announced else "广播尚未宣读规则"
+        stage = "主持人已宣读第 1 轮规则" if rules_announced else "主持人尚未宣读规则"
         updated_snapshot = llm.generate_memory_digest(
             role,
             previous_snapshot,

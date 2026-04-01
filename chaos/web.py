@@ -24,6 +24,8 @@ DOC_PATH = Path(__file__).resolve().parent.parent / "docs" / "角色池设定.md
 KEY_PATH = Path(__file__).resolve().parent.parent / "key.yaml"
 LOG_PATH = Path(__file__).resolve().parent.parent / "logs" / "chaos_runtime.jsonl"
 STATIC_DIR = Path(__file__).resolve().parent.parent / "web"
+TOTAL_CONTESTANTS = 10
+ROUND_ONE_ELIMINATION_COUNT = 2
 
 
 def _build_player() -> Role:
@@ -119,13 +121,19 @@ class WebGameSession:
             if self.phase_id == "resolved":
                 raise ValueError("游戏已经结算，不能继续发言。")
             before = self._current_cursor()
-            if conversation_id in {"lobby", "broadcast"}:
+            if conversation_id == "lobby":
                 self.game.player_public_speak(cleaned)
                 self._append_llm_public_replies(trigger_text=cleaned, trigger_speaker_id=self.player.role_id)
             elif conversation_id.startswith("private:"):
                 target_id = conversation_id.split(":", 1)[1]
-                self.game.player_private_speak(target_id, cleaned)
-                self._append_llm_private_reply(target_id)
+                if target_id == "environment":
+                    raise ValueError("环境 agent 不支持私聊。")
+                if target_id == "broadcast":
+                    self.game.player_host_private_speak(cleaned)
+                    self.game.host_private_message()
+                else:
+                    self.game.player_private_speak(target_id, cleaned)
+                    self._append_llm_private_reply(target_id)
             else:
                 raise ValueError(f"未知会话: {conversation_id}")
             return self.delta_payload(before)
@@ -133,7 +141,7 @@ class WebGameSession:
     def choose_number(self, value: int) -> dict[str, Any]:
         with self.lock:
             if self.phase_id != "round_execution":
-                raise ValueError("广播还没宣读规则，现在不能提交数字。")
+                raise ValueError("主持人还没宣读规则，现在不能提交数字。")
             if self.player_has_chosen:
                 raise ValueError("你已经提交过数字了。")
             if not 0 <= value <= 100:
@@ -162,10 +170,21 @@ class WebGameSession:
         if LOG_PATH.exists():
             LOG_PATH.unlink()
         roles = load_roles(DOC_PATH)
+        if len(roles) < TOTAL_CONTESTANTS:
+            raise RuntimeError(f"角色池数量不足：至少需要 {TOTAL_CONTESTANTS} 人，当前仅 {len(roles)} 人。")
         self.player = _build_player()
-        self.contestants = [self.player, *roles[1:]]
+        npc_count = TOTAL_CONTESTANTS - 1
+        npc_roles = [role for role in roles if role.role_id != self.player.role_id][:npc_count]
+        if len(npc_roles) < npc_count:
+            raise RuntimeError(f"可用 NPC 数量不足：至少需要 {npc_count} 人，当前仅 {len(npc_roles)} 人。")
+        self.contestants = [self.player, *npc_roles]
         llm = _build_llm_client()
-        self.game = RoundOneGame(player=self.player, contestants=self.contestants, llm=llm)
+        self.game = RoundOneGame(
+            player=self.player,
+            contestants=self.contestants,
+            llm=llm,
+            elimination_count=ROUND_ONE_ELIMINATION_COUNT,
+        )
         self.phase_id = "free_social"
         self.phase_label = "自由社交阶段"
         self.phase_deadline_seconds = 180
@@ -180,6 +199,7 @@ class WebGameSession:
         self._append_seed_social_messages()
 
     def _transition_to_execution(self) -> None:
+        self.game.execution_environment_message()
         self.game.broadcast_round_intro_message()
         self.phase_id = "round_execution"
         self.phase_label = "第 1 轮执行阶段"
@@ -195,6 +215,7 @@ class WebGameSession:
         self.phase_label = "第 1 轮已结算"
         self.phase_deadline_seconds = 0
         self.phase_started_at = time.time()
+        self.game.resolved_environment_message()
         self._append_result_messages(self.result)
 
     def _append_result_messages(self, result: RoundOneResult) -> None:
@@ -207,7 +228,7 @@ class WebGameSession:
         messages = [
             Message(
                 speaker_id="broadcast",
-                speaker_name="广播 agent",
+                speaker_name="主持人",
                 text=f"第 1 轮结算完成。全体真实平均值为 {result.average:.2f}，目标数为 {result.target:.2f}。",
                 visibility="public",
                 source="system",
@@ -215,15 +236,15 @@ class WebGameSession:
             ),
             Message(
                 speaker_id="broadcast",
-                speaker_name="广播 agent",
-                text=f"前 8 名存活者包括：{top_survivors}。",
+                speaker_name="主持人",
+                text=f"本轮 {len(result.survivors)} 人存活，包括：{top_survivors}。",
                 visibility="public",
                 source="system",
                 recipients=[role.role_id for role in self.contestants],
             ),
             Message(
                 speaker_id="broadcast",
-                speaker_name="广播 agent",
+                speaker_name="主持人",
                 text=outcome,
                 visibility="public",
                 source="system",
@@ -283,7 +304,6 @@ class WebGameSession:
             "recipients": message.recipients,
             "created_at": message.created_at,
             "in_lobby": message.visibility == "public",
-            "in_broadcast": message.visibility == "public" and message.speaker_id in {"broadcast", "system", "environment"},
             "is_player": message.speaker_id == self.player.role_id,
         }
 
@@ -296,10 +316,10 @@ class WebGameSession:
                 "summary": self._conversation_summary("lobby"),
             },
             {
-                "id": "broadcast",
-                "title": "广播",
-                "kind": "public",
-                "summary": self._conversation_summary("broadcast"),
+                "id": "private:broadcast",
+                "title": "主持人（私聊）",
+                "kind": "private",
+                "summary": self._conversation_summary("private:broadcast"),
             },
         ]
         for role in self.contestants:
@@ -321,21 +341,12 @@ class WebGameSession:
         if not messages:
             if conversation_id.startswith("private:"):
                 return "尚无私聊"
-            if conversation_id == "broadcast":
-                return "制度性消息与主持发言"
             return "所有公开消息会在这里汇集"
         return messages[-1].text[:40]
 
     def _messages_for_conversation(self, conversation_id: str) -> list[Message]:
         if conversation_id == "lobby":
             return [message for message in self.game.messages if message.visibility == "public"]
-        if conversation_id == "broadcast":
-            return [
-                message
-                for message in self.game.messages
-                if message.visibility == "public"
-                and message.speaker_id in {"broadcast", "system", "environment"}
-            ]
         if conversation_id.startswith("private:"):
             role_id = conversation_id.split(":", 1)[1]
             return self.game.private_messages_for(role_id)
@@ -353,9 +364,9 @@ class WebGameSession:
             "can_choose_number": self.phase_id == "round_execution" and not self.player_has_chosen,
             "can_end_phase": self.phase_id in {"free_social", "round_execution"},
             "rules_summary": (
-                "先公开交流，再秘密提交 0-100 的整数。目标数为全体真实平均值的一半，距离目标最近的前 16 名存活。"
+                f"先公开交流，再秘密提交 0-100 的整数。目标数为全体真实平均值的一半，距离目标最近的前 {self.game.survivor_quota()} 名存活。"
                 if self.game.rules_announced
-                else "广播尚未宣读第 1 轮规则。你现在处于自由社交阶段。"
+                else "主持人尚未宣读第 1 轮规则。你现在处于自由社交阶段。"
             ),
             "result": self._serialize_result(self.result),
         }
@@ -363,6 +374,10 @@ class WebGameSession:
     def _serialize_result(self, result: RoundOneResult | None) -> dict[str, Any] | None:
         if result is None:
             return None
+        ranking_map = {
+            role.role_id: (value, distance)
+            for role, value, distance in result.rankings
+        }
         player_alive = any(role.role_id == self.player.role_id for role in result.survivors)
         return {
             "average": round(result.average, 2),
@@ -372,19 +387,19 @@ class WebGameSession:
                 {
                     "role_id": role.role_id,
                     "name": role.name,
-                    "value": value,
-                    "distance": round(distance, 2),
+                    "value": ranking_map[role.role_id][0],
+                    "distance": round(ranking_map[role.role_id][1], 2),
                 }
-                for role, value, distance in result.rankings[:16]
+                for role in result.survivors
             ],
             "eliminated": [
                 {
                     "role_id": role.role_id,
                     "name": role.name,
-                    "value": value,
-                    "distance": round(distance, 2),
+                    "value": ranking_map[role.role_id][0],
+                    "distance": round(ranking_map[role.role_id][1], 2),
                 }
-                for role, value, distance in result.rankings[16:]
+                for role in result.eliminated
             ],
         }
 
@@ -454,7 +469,7 @@ class ChaosHTTPRequestHandler(BaseHTTPRequestHandler):
                 self._serve_file(parsed.path.removeprefix("/static/"))
                 return
             if parsed.path == "/api/bootstrap":
-                self._write_json(HTTPStatus.OK, self.session_manager.bootstrap_payload())
+                self._safe_write_json(HTTPStatus.OK, self.session_manager.bootstrap_payload())
                 return
             if parsed.path == "/api/state":
                 query = parse_qs(parsed.query)
@@ -462,16 +477,18 @@ class ChaosHTTPRequestHandler(BaseHTTPRequestHandler):
                 try:
                     cursor = int(raw_cursor or 0)
                 except (TypeError, ValueError):
-                    self._write_json(HTTPStatus.BAD_REQUEST, {"error": "cursor 必须是非负整数。"})
+                    self._safe_write_json(HTTPStatus.BAD_REQUEST, {"error": "cursor 必须是非负整数。"})
                     return
                 if cursor < 0:
-                    self._write_json(HTTPStatus.BAD_REQUEST, {"error": "cursor 必须是非负整数。"})
+                    self._safe_write_json(HTTPStatus.BAD_REQUEST, {"error": "cursor 必须是非负整数。"})
                     return
-                self._write_json(HTTPStatus.OK, self.session_manager.delta_payload(cursor))
+                self._safe_write_json(HTTPStatus.OK, self.session_manager.delta_payload(cursor))
                 return
-            self._write_json(HTTPStatus.NOT_FOUND, {"error": "未找到资源。"})
+            self._safe_write_json(HTTPStatus.NOT_FOUND, {"error": "未找到资源。"})
         except Exception as exc:
-            self._write_json(
+            if self._is_client_disconnect(exc):
+                return
+            self._safe_write_json(
                 HTTPStatus.INTERNAL_SERVER_ERROR,
                 {"error": f"{exc.__class__.__name__}: {exc}"},
             )
@@ -485,33 +502,35 @@ class ChaosHTTPRequestHandler(BaseHTTPRequestHandler):
                     str(payload.get("conversation_id", "")),
                     str(payload.get("text", "")),
                 )
-                self._write_json(HTTPStatus.OK, data)
+                self._safe_write_json(HTTPStatus.OK, data)
                 return
             if parsed.path == "/api/choose-number":
                 raw_value = payload.get("value")
                 if not isinstance(raw_value, int):
                     raise ValueError("数字必须是整数。")
                 data = self.session_manager.choose_number(raw_value)
-                self._write_json(HTTPStatus.OK, data)
+                self._safe_write_json(HTTPStatus.OK, data)
                 return
             if parsed.path == "/api/end-phase":
                 data = self.session_manager.end_phase()
-                self._write_json(HTTPStatus.OK, data)
+                self._safe_write_json(HTTPStatus.OK, data)
                 return
             if parsed.path == "/api/reset":
                 data = self.session_manager.reset()
-                self._write_json(HTTPStatus.OK, data)
+                self._safe_write_json(HTTPStatus.OK, data)
                 return
         except ValueError as exc:
-            self._write_json(HTTPStatus.BAD_REQUEST, {"error": str(exc)})
+            self._safe_write_json(HTTPStatus.BAD_REQUEST, {"error": str(exc)})
             return
         except Exception as exc:
-            self._write_json(
+            if self._is_client_disconnect(exc):
+                return
+            self._safe_write_json(
                 HTTPStatus.INTERNAL_SERVER_ERROR,
                 {"error": f"{exc.__class__.__name__}: {exc}"},
             )
             return
-        self._write_json(HTTPStatus.NOT_FOUND, {"error": "未找到资源。"})
+        self._safe_write_json(HTTPStatus.NOT_FOUND, {"error": "未找到资源。"})
 
     def log_message(self, format: str, *args: Any) -> None:
         return
@@ -534,11 +553,14 @@ class ChaosHTTPRequestHandler(BaseHTTPRequestHandler):
     def _serve_file(self, relative_path: str) -> None:
         file_path = (STATIC_DIR / relative_path).resolve()
         if not str(file_path).startswith(str(STATIC_DIR.resolve())) or not file_path.exists():
-            self._write_json(HTTPStatus.NOT_FOUND, {"error": "静态资源不存在。"})
+            self._safe_write_json(HTTPStatus.NOT_FOUND, {"error": "静态资源不存在。"})
             return
         content_type, _ = mimetypes.guess_type(file_path.name)
         self.send_response(HTTPStatus.OK)
         self.send_header("Content-Type", content_type or "application/octet-stream")
+        self.send_header("Cache-Control", "no-store, no-cache, must-revalidate, max-age=0")
+        self.send_header("Pragma", "no-cache")
+        self.send_header("Expires", "0")
         self.end_headers()
         self.wfile.write(file_path.read_bytes())
 
@@ -547,8 +569,26 @@ class ChaosHTTPRequestHandler(BaseHTTPRequestHandler):
         self.send_response(status)
         self.send_header("Content-Type", "application/json; charset=utf-8")
         self.send_header("Content-Length", str(len(body)))
+        self.send_header("Cache-Control", "no-store, no-cache, must-revalidate, max-age=0")
+        self.send_header("Pragma", "no-cache")
+        self.send_header("Expires", "0")
         self.end_headers()
         self.wfile.write(body)
+
+    def _safe_write_json(self, status: HTTPStatus, payload: dict[str, Any]) -> None:
+        try:
+            self._write_json(status, payload)
+        except Exception as exc:
+            if self._is_client_disconnect(exc):
+                return
+            raise
+
+    def _is_client_disconnect(self, exc: BaseException) -> bool:
+        if isinstance(exc, (BrokenPipeError, ConnectionResetError, ConnectionAbortedError)):
+            return True
+        if isinstance(exc, OSError) and exc.errno in {32, 104, 10053, 10054}:
+            return True
+        return False
 
 
 class ChaosHTTPServer(ThreadingHTTPServer):

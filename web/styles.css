@@ -207,12 +207,6 @@ body::before {
   font-weight: 700;
 }
 
-.conversation-subtitle {
-  margin-top: 6px;
-  color: var(--muted);
-  font-size: 14px;
-}
-
 .banner {
   max-width: 360px;
   border-radius: 14px;

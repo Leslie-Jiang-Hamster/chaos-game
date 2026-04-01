@@ -20,8 +20,6 @@ T = TypeVar("T")
 PUBLIC_SPEECH_PREFIX = load_prompt("public_speech")
 PRIVATE_REPLY_PREFIX = load_prompt("private_reply")
 NUMBER_PREFIX = load_prompt("number_choice")
-OPENING_SCENE_PREFIX = load_prompt("opening_scene")
-ENVIRONMENT_PREFIX = load_prompt("environment")
 MEMORY_DIGEST_PREFIX = load_prompt("memory_digest")
 
 
@@ -61,33 +59,6 @@ class ArkResponsesClient:
     prefix_cache_ids: dict[str, str] = field(default_factory=dict)
     non_cacheable_prefixes: set[str] = field(default_factory=set)
     last_usage: LLMUsage = field(default_factory=LLMUsage)
-
-    def generate_opening_scene(self, player: Role, contestant_count: int) -> str:
-        payload = (
-            f"玩家身份：{player.name}。\n"
-            f"玩家背景：{player.background}\n"
-            f"当前大厅内共有 {contestant_count} 人。\n"
-            "玩家失去了大部分记忆，只知道必须活下去。"
-        )
-        return self._generate_text("opening_scene", OPENING_SCENE_PREFIX, payload, max_output_tokens=220)
-
-    def generate_environment_reply(
-        self,
-        query: str,
-        rules_announced: bool,
-        visible_roles: Sequence[str],
-    ) -> str:
-        stage = "广播已宣读第 1 轮规则" if rules_announced else "广播尚未宣读规则"
-        visible_text = "、".join(visible_roles)
-        payload = (
-            f"当前状态：{stage}\n"
-            "公共环境：封闭大厅、白色灯光、消毒水气味、广播屏、倒计时装置、所有存活者始终同场。\n"
-            f"当前可见存活者人数：{len(visible_roles)}\n"
-            f"当前可见存活角色：{visible_text}\n"
-            f"玩家问题：{query}\n"
-            "回答应只基于上述公共事实，不能编造额外设施、出口、规则细节或他人内心。"
-        )
-        return self._generate_text("environment", ENVIRONMENT_PREFIX, payload, max_output_tokens=160)
 
     def generate_public_decision(
         self,

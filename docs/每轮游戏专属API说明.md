@@ -7,7 +7,7 @@
 不包含：
 - 基础动作 `speak(target_scope, text)`
 - 基础动作 `end_phase()`
-- 广播 agent 与系统环境文本的行为细节
+- 主持人与系统环境文本的行为细节（含“环境不可私聊、仅转场固定文本、不接 LLM”）
 - 各轮完整数值平衡与文案表现
 
 本文的作用是把“每轮游戏里角色到底能调用什么动作、参数怎么写、何时可调、引擎如何校验”固定下来。
@@ -47,7 +47,7 @@
 ### 2.3 ID 与基础类型
 
 ```text
-contestant_id = "001" ~ "032"
+contestant_id = "001" ~ "010"（当前对局）
 side = "left" | "right"
 ```
 
@@ -55,6 +55,17 @@ side = "left" | "right"
 - `contestant_id` 使用三位字符串
 - 玩家也是合法 `contestant_id`
 - 轮到双人局时，目标集合会被引擎自动缩小到该局允许的对象
+- 完整角色池可超过 10 人，但单局只会选入 10 人参赛
+
+### 2.4 当前赛制人数
+
+```text
+10 -> 8 -> 6 -> 4 -> 2 -> 1
+```
+
+规则：
+- 前 4 轮每轮淘汰 2 人
+- 第 5 轮 2 进 1
 
 ## 3. 第 1 轮：诱饵均值
 
@@ -101,7 +112,7 @@ submitted_number[player_id] = value
 - 计算全体真实平均值
 - 目标数 = 平均值的 `1/2`
 - 计算每名选手与目标数的距离
-- 选出前 16 名存活者
+- 选出前 8 名存活者
 
 示例：
 
@@ -227,7 +238,7 @@ bridge_segment_path[segment_index][player_id] = side
 示例：
 
 ```text
-choose_partner("011")
+choose_partner("008")
 choose_order("self_first")
 choose_path("left")
 ```
@@ -374,7 +385,7 @@ blade_target[player_id] = target_id
 
 ```text
 give_key_to("003")
-give_blade_to("011")
+give_blade_to("008")
 ```
 
 ## 7. 第 5 轮：终局审问
@@ -514,7 +525,7 @@ pass_guess()
 
 ```text
 choose_die_face(5)
-guess_die_face("031", 2)
+guess_die_face("010", 2)
 pass_guess()
 ```
 

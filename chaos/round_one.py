@@ -19,6 +19,7 @@ class RoundOneGame:
     player: Role
     contestants: list[Role]
     llm: ArkResponsesClient | None = None
+    elimination_count: int = 2
     rng: random.Random = field(default_factory=lambda: random.Random(7))
     rules_announced: bool = False
     messages: list[Message] = field(default_factory=list)
@@ -31,24 +32,50 @@ class RoundOneGame:
     next_message_id: int = 1
 
     def __post_init__(self) -> None:
+        if len(self.contestants) < 2:
+            raise ValueError("参赛者数量不足，至少需要 2 人。")
+        if not 1 <= self.elimination_count < len(self.contestants):
+            raise ValueError("淘汰人数配置非法，必须在 1 到参赛者总数减 1 之间。")
         self.memory_store = RoleMemoryStore(
             player=self.player,
             contestants=self.contestants,
         )
 
+    def survivor_quota(self) -> int:
+        return max(1, len(self.contestants) - self.elimination_count)
+
     def opening_environment_message(self) -> Message:
-        llm = self._require_llm("opening_scene")
-        try:
-            text = llm.generate_opening_scene(self.player, len(self.contestants))
-            source = "llm"
-        except Exception as exc:
-            raise self._llm_action_error("opening_scene", exc) from exc
+        text = "冷白灯骤然亮起，封闭大厅的金属门依次上锁。墙面倒计时开始跳动，所有人被迫进入同一个空旷的房间。所有人面面相觑，看着彼此身上显眼的红色数字灯牌。"
         message = Message(
             speaker_id="environment",
-            speaker_name="环境 agent",
+            speaker_name="环境",
             text=text,
             visibility="public",
-            source=source,
+            source="system",
+            recipients=[contestant.role_id for contestant in self.contestants],
+        )
+        self._append_public_message(message)
+        return message
+
+    def execution_environment_message(self) -> Message:
+        message = Message(
+            speaker_id="environment",
+            speaker_name="环境",
+            text="大厅上方出现新的提示面板：自由交流结束，数字提交通道已开启。",
+            visibility="public",
+            source="system",
+            recipients=[contestant.role_id for contestant in self.contestants],
+        )
+        self._append_public_message(message)
+        return message
+
+    def resolved_environment_message(self) -> Message:
+        message = Message(
+            speaker_id="environment",
+            speaker_name="环境",
+            text="远端闸门短暂开启又关闭，被淘汰者死亡，存活者被留在原地等待下一轮。",
+            visibility="public",
+            source="system",
             recipients=[contestant.role_id for contestant in self.contestants],
         )
         self._append_public_message(message)
@@ -58,11 +85,11 @@ class RoundOneGame:
         self.rules_announced = True
         message = Message(
             speaker_id="broadcast",
-            speaker_name="广播 agent",
+            speaker_name="主持人",
             text=(
                 "第 1 轮《诱饵均值》即将开始。所有存活者先进行公开交流，"
                 "随后各自秘密提交一个 0 到 100 的整数。目标数为全体真实平均值的一半，"
-                "距离目标最近的前 16 名存活。"
+                f"距离目标最近的前 {self.survivor_quota()} 名存活。"
             ),
             visibility="public",
             source="system",
@@ -70,19 +97,6 @@ class RoundOneGame:
         )
         self._append_public_message(message)
         return message
-
-    def environment_reply(self, query: str) -> tuple[str, str]:
-        visible_roles = [role.short_label for role in self.contestants]
-        llm = self._require_llm("environment")
-        try:
-            text = llm.generate_environment_reply(
-                query,
-                self.rules_announced,
-                visible_roles,
-            )
-        except Exception as exc:
-            raise self._llm_action_error("environment", exc) from exc
-        return text, "llm"
 
     def seed_social_phase(self) -> list[Message]:
         speakers = self._pick_public_speakers(
@@ -117,16 +131,16 @@ class RoundOneGame:
         self._append_public_message(message)
         return message
 
-    def player_environment_speak(self, text: str) -> Message:
+    def player_host_private_speak(self, text: str) -> Message:
         message = Message(
             speaker_id=self.player.role_id,
             speaker_name=self.player.name,
             text=text.strip(),
             visibility="private",
             source="player",
-            recipients=["environment"],
+            recipients=[self.player.role_id, "broadcast"],
         )
-        self._append_message_log_only(message)
+        self._append_private_message("broadcast", message)
         return message
 
     def npc_public_replies(self, trigger_text: str, trigger_speaker_id: str) -> list[Message]:
@@ -150,17 +164,17 @@ class RoundOneGame:
             replies.append(message)
         return replies
 
-    def environment_message(self, query: str) -> Message:
-        text, source = self.environment_reply(query)
+    def host_private_message(self) -> Message:
+        text, source = self._host_private_line()
         message = Message(
-            speaker_id="environment",
-            speaker_name="环境 agent",
+            speaker_id="broadcast",
+            speaker_name="主持人",
             text=text,
             visibility="private",
             source=source,
-            recipients=[self.player.role_id],
+            recipients=[self.player.role_id, "broadcast"],
         )
-        self._append_message_log_only(message)
+        self._append_private_message("broadcast", message)
         return message
 
     def player_private_speak(self, target_id: str, text: str) -> Message:
@@ -210,8 +224,8 @@ class RoundOneGame:
             distance = abs(value - target)
             rankings.append((role, value, distance))
         rankings.sort(key=lambda item: (item[2], item[1], item[0].role_id))
-        survivors = [item[0] for item in rankings[:16]]
-        eliminated = [item[0] for item in rankings[16:]]
+        survivors = [item[0] for item in rankings[: self.survivor_quota()]]
+        eliminated = [item[0] for item in rankings[self.survivor_quota() :]]
         return RoundOneResult(
             average=avg,
             target=target,
@@ -255,10 +269,6 @@ class RoundOneGame:
         self.public_turn_index += 1
         self.public_last_spoke_turn[message.speaker_id] = self.public_turn_index
         self.memory_store.observe_message(message)
-
-    def _append_message_log_only(self, message: Message) -> None:
-        self._assign_message_id(message)
-        self.messages.append(message)
 
     def _append_private_message(self, role_id: str, message: Message) -> None:
         self._assign_message_id(message)
@@ -401,6 +411,25 @@ class RoundOneGame:
             action_summary=decision.text,
         )
         return decision.text, "llm"
+
+    def _host_private_line(self) -> tuple[str, str]:
+        thread = self.private_threads.get("broadcast", [])
+        latest_player_text = ""
+        for message in reversed(thread):
+            if message.speaker_id == self.player.role_id:
+                latest_player_text = message.text.strip()
+                break
+
+        if any(token in latest_player_text for token in ("规则", "怎么玩", "怎么赢", "目标", "数字")):
+            return (
+                f"规则重申：提交 0 到 100 的整数，目标数是全体真实平均值的一半，距离目标最近的前 {self.survivor_quota()} 名存活。",
+                "system",
+            )
+        if not self.rules_announced:
+            return ("当前仍是自由社交阶段。阶段切换时我会在公共频道统一宣读规则。", "system")
+        if any(token in latest_player_text for token in ("截止", "倒计时", "时间", "多久")):
+            return ("执行阶段进行中。请在阶段结束前完成数字提交。", "system")
+        return ("主持人仅负责规则与流程说明，不提供私人策略建议。", "system")
 
     def _npc_number(self, role: Role) -> int:
         llm = self._require_llm("number_choice")

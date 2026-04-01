@@ -11,7 +11,6 @@ const appState = {
 const elements = {
   conversationList: document.getElementById("conversation-list"),
   conversationTitle: document.getElementById("conversation-title"),
-  conversationSubtitle: document.getElementById("conversation-subtitle"),
   messageFeed: document.getElementById("message-feed"),
   banner: document.getElementById("banner"),
   messageForm: document.getElementById("message-form"),
@@ -20,6 +19,10 @@ const elements = {
   composerHint: document.getElementById("composer-hint"),
 };
 
+for (const staleSubtitle of document.querySelectorAll(".conversation-subtitle")) {
+  staleSubtitle.remove();
+}
+
 function conversationMeta(id) {
   return appState.conversations.find((item) => item.id === id) || null;
 }
@@ -27,9 +30,6 @@ function conversationMeta(id) {
 function visibleMessages(conversationId) {
   if (conversationId === "lobby") {
     return appState.messages.filter((message) => message.in_lobby);
-  }
-  if (conversationId === "broadcast") {
-    return appState.messages.filter((message) => message.in_broadcast);
   }
   return appState.messages.filter((message) => message.conversation_id === conversationId);
 }
@@ -59,7 +59,7 @@ function formatTime(timestamp) {
 
 function messageTag(message) {
   if (message.speaker_id === "broadcast") {
-    return "广播";
+    return "主持人";
   }
   if (message.speaker_id === "system") {
     return "系统";
@@ -174,15 +174,14 @@ function renderHeader() {
     return;
   }
   elements.conversationTitle.textContent = conversation.title;
-  elements.conversationSubtitle.textContent = conversation.summary || "";
   if (appState.state && appState.state.phase_id === "resolved") {
     elements.composerHint.textContent = "本局已结算，当前会话只读。";
-  } else if (conversation.id === "broadcast") {
-    elements.composerHint.textContent = "广播窗口中的发言仍会作为公开消息进入公共大厅。";
+  } else if (conversation.id === "private:broadcast") {
+    elements.composerHint.textContent = "这里是你与主持人的私聊窗口，适合单独确认规则和流程。";
   } else if (conversation.id.startsWith("private:")) {
     elements.composerHint.textContent = "当前是单聊窗口，只有你和目标角色能看到这里的消息。";
   } else {
-    elements.composerHint.textContent = "公开发言会进入公共大厅，并可能触发 NPC 的公开回应。";
+    elements.composerHint.textContent = "公开发言会进入公共大厅，对其他人可见。";
   }
 }
 
@@ -227,13 +226,25 @@ function mergePayload(payload) {
 }
 
 async function requestJson(url, options = {}) {
-  const response = await fetch(url, {
-    headers: { "Content-Type": "application/json" },
-    ...options,
-  });
-  const payload = await response.json();
+  let response;
+  try {
+    response = await fetch(url, {
+      headers: { "Content-Type": "application/json" },
+      ...options,
+    });
+  } catch (error) {
+    throw new Error("无法连接后端服务。请确认已运行 python3 main.py，并通过 http://127.0.0.1:8000 访问。");
+  }
+
+  let payload;
+  try {
+    payload = await response.json();
+  } catch (error) {
+    throw new Error(`后端响应不是合法 JSON（HTTP ${response.status}）。`);
+  }
+
   if (!response.ok) {
-    throw new Error(payload.error || "请求失败。");
+    throw new Error(payload.error || `请求失败（HTTP ${response.status}）。`);
   }
   return payload;
 }
