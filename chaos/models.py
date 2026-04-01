@@ -1,5 +1,6 @@
 from __future__ import annotations
 
+import time
 from dataclasses import dataclass, field
 from typing import Literal
 
@@ -34,6 +35,8 @@ class Message:
     visibility: Visibility
     source: MessageSource = "system"
     recipients: list[str] = field(default_factory=list)
+    message_id: int = 0
+    created_at: float = field(default_factory=time.time)
 
 
 @dataclass(slots=True)

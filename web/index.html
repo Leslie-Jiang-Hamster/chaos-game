@@ -1,0 +1,50 @@
+<!doctype html>
+<html lang="zh-CN">
+  <head>
+    <meta charset="utf-8" />
+    <meta name="viewport" content="width=device-width, initial-scale=1" />
+    <title>Chaos Web MVP</title>
+    <link rel="stylesheet" href="/static/styles.css" />
+  </head>
+  <body>
+    <div class="shell">
+      <aside class="sidebar">
+        <div class="brand">
+          <div class="brand-mark">Chaos</div>
+          <div class="brand-copy">
+            <h1>混沌生还者</h1>
+            <p>聊天 UI Web MVP</p>
+          </div>
+        </div>
+        <div class="sidebar-section">
+          <div class="section-title">会话</div>
+          <div id="conversation-list" class="conversation-list"></div>
+        </div>
+      </aside>
+
+      <main class="main-panel">
+        <header class="conversation-header">
+          <div class="header-copy">
+            <div id="conversation-title" class="conversation-title">公共大厅</div>
+            <div id="conversation-subtitle" class="conversation-subtitle">所有公开消息会在这里汇集</div>
+          </div>
+          <div id="banner" class="banner"></div>
+        </header>
+
+        <section id="message-feed" class="message-feed"></section>
+
+        <footer class="composer">
+          <form id="message-form" class="message-form">
+            <textarea id="message-input" rows="2" placeholder="在当前会话里输入发言"></textarea>
+            <div class="composer-actions">
+              <div id="composer-hint" class="composer-hint">广播窗口发送的内容也会作为公开发言进入大厅。</div>
+              <button id="send-button" type="submit">发送</button>
+            </div>
+          </form>
+        </footer>
+      </main>
+    </div>
+
+    <script src="/static/app.js"></script>
+  </body>
+</html>

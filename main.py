@@ -1,4 +1,4 @@
-from chaos.cli import run
+from chaos.web import run
 
 
 if __name__ == "__main__":

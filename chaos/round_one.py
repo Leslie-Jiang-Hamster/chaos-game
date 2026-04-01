@@ -28,6 +28,7 @@ class RoundOneGame:
     memory_store: RoleMemoryStore = field(init=False)
     public_turn_index: int = 0
     public_last_spoke_turn: dict[str, int] = field(default_factory=dict)
+    next_message_id: int = 1
 
     def __post_init__(self) -> None:
         self.memory_store = RoleMemoryStore(
@@ -39,6 +40,7 @@ class RoundOneGame:
         llm = self._require_llm("opening_scene")
         try:
             text = llm.generate_opening_scene(self.player, len(self.contestants))
+            source = "llm"
         except Exception as exc:
             raise self._llm_action_error("opening_scene", exc) from exc
         message = Message(
@@ -46,7 +48,7 @@ class RoundOneGame:
             speaker_name="环境 agent",
             text=text,
             visibility="public",
-            source="llm",
+            source=source,
             recipients=[contestant.role_id for contestant in self.contestants],
         )
         self._append_public_message(message)
@@ -227,6 +229,12 @@ class RoundOneGame:
     def list_alive(self) -> list[Role]:
         return self.contestants
 
+    def public_messages(self) -> list[Message]:
+        return [message for message in self.messages if message.visibility == "public"]
+
+    def private_messages_for(self, role_id: str) -> list[Message]:
+        return list(self.private_threads.get(role_id, []))
+
     def _memory(self) -> MemoryContextBuilder:
         return self.memory_store.build_context(
             messages=self.messages,
@@ -242,17 +250,27 @@ class RoundOneGame:
         )
 
     def _append_public_message(self, message: Message) -> None:
+        self._assign_message_id(message)
         self.messages.append(message)
         self.public_turn_index += 1
         self.public_last_spoke_turn[message.speaker_id] = self.public_turn_index
         self.memory_store.observe_message(message)
 
     def _append_message_log_only(self, message: Message) -> None:
+        self._assign_message_id(message)
         self.messages.append(message)
 
     def _append_private_message(self, role_id: str, message: Message) -> None:
+        self._assign_message_id(message)
+        self.messages.append(message)
         self.private_threads.setdefault(role_id, []).append(message)
         self.memory_store.observe_message(message)
+
+    def _assign_message_id(self, message: Message) -> None:
+        if message.message_id:
+            return
+        message.message_id = self.next_message_id
+        self.next_message_id += 1
 
     def _opening_public_budget(self) -> int:
         options = [1, 1, 2, 2, 3] if not self.rules_announced else [1, 2, 2, 3, 3]
@@ -335,9 +353,9 @@ class RoundOneGame:
     def _npc_public_line(self, role: Role, index: int) -> tuple[str, str]:
         del index
         llm = self._require_llm("public_speech")
-        self._refresh_role_memory(role)
-        memory = self._memory()
         try:
+            self._refresh_role_memory(role)
+            memory = self._memory()
             decision = llm.generate_public_decision(
                 role,
                 self.rules_announced,
@@ -362,9 +380,9 @@ class RoundOneGame:
         else:
             player_text = ""
         llm = self._require_llm("private_reply")
-        self._refresh_role_memory(role)
-        memory = self._memory()
         try:
+            self._refresh_role_memory(role)
+            memory = self._memory()
             decision = llm.generate_private_decision(
                 role,
                 player_text,
@@ -386,9 +404,9 @@ class RoundOneGame:
 
     def _npc_number(self, role: Role) -> int:
         llm = self._require_llm("number_choice")
-        self._refresh_role_memory(role)
-        memory = self._memory()
         try:
+            self._refresh_role_memory(role)
+            memory = self._memory()
             decision = llm.generate_number_decision(
                 role,
                 memory.recent_public_lines(limit=PUBLIC_MEMORY_WINDOW),
@@ -439,12 +457,12 @@ class RoundOneGame:
         if self.llm is None:
             raise LLMActionError(
                 capability,
-                f"[LLM] {capability} 当前不可用，未配置可继续调用的模型。你可以继续输入其他命令，稍后再试。",
+                f"[LLM] {capability} 当前不可用，且已禁用本地回退。请检查 key.yaml、模型配置和网络连通性。",
             )
         return self.llm
 
     def _llm_action_error(self, capability: str, exc: Exception) -> LLMActionError:
         return LLMActionError(
             capability,
-            f"[LLM] {capability} 调用失败，重试后仍未成功：{exc}。这次动作没有执行，你可以继续输入命令重试。",
+            f"[LLM] {capability} 调用失败（{exc.__class__.__name__}）：{exc}",
         )
